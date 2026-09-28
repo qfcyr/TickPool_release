@@ -1,4 +1,4 @@
-TickPool面向 Tick 的确定性并行任务调度引擎 在设计完后使用deepseek开发 由于原始仓库被dsh搞的面目全非 特此开这个仓库
+TickPool 是面向 Tick 的确定性并行任务调度引擎 在设计完后使用deepseek开发 由于原始仓库被dsh搞的面目全非 特此开这个仓库
 
 
 # TickPool — 使用文档（完整版）
