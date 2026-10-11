@@ -47,6 +47,9 @@ struct RuntimeState {
     std::vector<TaskAsyncHot> asyncHotTable_;
     std::vector<TaskColdData> coldTable_;
     BufferRegistry            bufferRegistry_; // 统一持有所有队列
+    // 注册了异步能力的 TaskID 清单（defineTask 时追加）—— run 线程在每个 tick 开头按此遍历做
+    // "异步结果边界发布"，避免每 tick 扫全表。定义期（run 之前）建好后只读，无需同步。
+    std::vector<uint32_t>     asyncTaskIds_;
 
     // ---------- 运行进度与时间控制 ----------
     std::atomic<size_t> tickCount_{ 0 };

@@ -121,6 +121,15 @@ concept TickDuration = requires {
 template<typename T>
 concept ThreadPool = requires(T & pool, size_t idx, std::function<void()> task) {
     { pool.enqueue(idx, std::move(task)) } -> std::same_as<void>;
+    // 异步泳道是硬要求：异步体只走这条通道（缺它就无法满足"异步不在调用线程执行"）。
+    // wakeWorkers/waitIdle 是既有事实依赖（tick 派发阶段无条件 wakeWorkers；清场与析构调 waitIdle），
+    // 一并写进概念，好让自定义线程池的缺失在编译期报清楚。
+    { pool.enqueueAsync(std::move(task)) } -> std::same_as<void>;
+    { pool.wakeWorkers() } -> std::same_as<void>;
+    { pool.waitIdle() } -> std::same_as<void>;
+    { pool.waitAsyncIdle() } -> std::same_as<void>;
+    { pool.pendingAsyncWork() } -> std::same_as<size_t>;
+    { pool.executeUpTo(idx, size_t{ 1 }) } -> std::same_as<size_t>;
     { pool.tryExecuteOne(idx) } -> std::same_as<bool>;
     { pool.threadCount() } -> std::same_as<size_t>;
 };
@@ -308,6 +317,14 @@ public:
     void enqueue(NonVoid_t<T>&& item) {
         queue_.try_enqueue(std::move(item));
     }
+    // 非阻塞单条入/出队（边界发布用 —— 发布**绝不能阻塞**：它跑在 run 线程上，而可读队列的
+    // 消费者（destruct）在本 tick 更靠后的位置，阻塞等待 = 自锁）
+    bool tryEnqueue(NonVoid_t<T>&& item) {
+        return queue_.try_enqueue(std::move(item));
+    }
+    bool tryDequeue(NonVoid_t<T>& out) {
+        return queue_.try_dequeue(out);
+    }
     size_t dequeueBulkTyped(std::vector<NonVoid_t<T>>& output, size_t limit) {
         return queue_.try_dequeue_bulk(std::back_inserter(output), limit);
     }
@@ -364,6 +381,13 @@ struct DefaultTickPoolOptions {
 
     // 可按池通过派生 OptionsT 覆盖（同 enableCommandLog 的模式）。
     static constexpr uint32_t inlineWaveMaxTasks = TICKPOOL_INLINE_WAVE_MAX_TASKS;
+
+    // 异步专用线程比例：0（默认）= 不预留（异步与 tick 共享全部线程）；>0 = 预留
+    // round(N × ratio) 条线程只服务异步泳道（clamp 到 [1, N-1]），其余线程做 tick 任务。
+    // 为什么要预留：共池时一个长异步体会占住 worker，把 tick 自己的 construct/子任务排到后面。
+    // 单向帮忙：异步线程空闲时可偷 tick 队列；**tick 线程永不消费异步泳道** ——
+    // "异步不占用 tick 线程 / run 线程"不因预留而改变。N < 2 且 ratio > 0 → 池构造抛 invalid_argument。
+    static constexpr double asyncThreadRatio = TICKPOOL_ASYNC_THREAD_RATIO;
 };
 
 static_assert((DefaultTickPoolOptions::shortDelayRingSize& (DefaultTickPoolOptions::shortDelayRingSize - 1)) == 0,
@@ -531,6 +555,16 @@ struct TaskAsyncHot {
     bool (*dropOldestAsync)(void* typedQueuePtr) = nullptr;
     size_t(*asyncSize)(void* typedQueuePtr) = nullptr;
     void (*asyncClear)(void* typedQueuePtr) = nullptr;   // 恢复时清空异步队列
+
+    // 异步泳道 → tick 边界发布。泳道线程把结果写进 staging（上面的入队函数指向它）；run 线程在
+    // 每个 tick 开头把 staging 发布到可读队列（TaskTickHot::asyncQueueRaw，读侧完全不变）。
+    // 规则：**在 tick N 内提交的异步结果，最早在 tick N+1 的回调（含 destruct）可见**。
+    // 发布**永不阻塞**：可读队列的消费者在本 tick 更靠后的 destruct 里，阻塞等空间 = 自锁；
+    // 队列满时剩余条目留在 staging（外加 1 条滞留槽保证不丢），下个边界继续搬。
+    void* asyncStagingRaw = nullptr;
+    void* asyncCarryRaw = nullptr;      // 滞留槽（容量 1 条/任务）
+    bool  asyncCarryPending = false;
+    void (*asyncPublish)(TaskAsyncHot& hot, void* stagingQueue, void* visibleQueue) noexcept = nullptr;
 };
 
 // 任务冷数据
@@ -1079,6 +1113,25 @@ public:
 
     void run(size_t tickCount = 0);
     void stop();
+
+    // 等待所有在途工作结束（含**异步泳道**）并把暂存异步结果发布到可读队列。
+    // 为什么需要：真异步之后"提交返回"不再等于"异步体已跑完"，结果也可能还停在 staging
+    // （要到下一个 tick 边界才发布）。在 tick 之外需要对账（停机前、断言前、进临界区前）用它。
+    // 行为：阻塞到线程池 inFlight_ 归零（并行子任务 + construct/destruct + 异步体），随后发布；
+    // 结果仍按老规矩在 destruct 里用 withAsyncResults 读。tick 回调内调用不会死锁（异步体不依赖
+    // tick），但会把结果提前发布、不再是边界语义 —— 正常用法是 tick 之间或 stop() 之后。
+    void waitIdle();
+
+    // 等**全部在途异步体**结束并把暂存结果发布到可读队列 —— 返回时"该产出的结果都已就绪，
+    // 再跑 1 个 tick 就能在 destruct 里取走"。
+    //   - **不得在 tick 回调内调用**：提前发布会破坏"tick N 提交 → 最早 tick N+1 可见"的边界规则
+    //     → 抛 std::runtime_error（不静默改变语义）；
+    //   - 用户异步体永久阻塞时它会一直等（框架不中断用户代码）；
+    //   - 只等异步体；要等"全部工作"（含 tick 任务）用上面的 waitIdle()。
+    void waitAsyncIdle();
+    // 在途异步体数（诊断/自检；含正在执行与已入队未认领）
+    size_t pendingAsyncWork() const noexcept;
+
     void setTimeScale(double factor);
     double timeScale() const noexcept;
     void pause(); void resume();
@@ -1221,6 +1274,9 @@ private:
         }
 #endif
     }
+
+    // 默认线程池构造：把 options.asyncThreadRatio 传下去（自定义池不支持该构造签名时回退默认构造）
+    static std::unique_ptr<ThreadPoolType> makeDefaultThreadPool();
 
     TaskID getTaskID(const TaskKey& key) const {
         return taskRegistry_.taskId(key);   // TaskRegistry（defineTask 注册即维护，run 前可解析）

@@ -23,10 +23,19 @@ namespace tickpool_detail {
 
 class WorkStealingThreadPool {
 public:
-    explicit WorkStealingThreadPool(size_t numThreads = std::thread::hardware_concurrency());
+    // asyncThreadRatio（0..1）：异步专用线程比例。
+    //   0  = 不预留（默认）：异步与 tick 共享全部线程；
+    //   >0 = 预留 A = clamp(round(N×ratio), 1, N-1) 条线程只服务异步泳道，其余做 tick 任务；
+    //        N < 2 时无法预留 → 构造抛 std::invalid_argument（不静默退化）。
+    // 角色**构造期定死**：不新增线程（总数 N 不变），运行期不改角色。
+    // 单向帮忙：异步线程空闲时可偷 tick 队列；**tick 线程永不消费异步泳道**。
+    explicit WorkStealingThreadPool(size_t numThreads = std::thread::hardware_concurrency(),
+                                    double asyncThreadRatio = 0.0);
     ~WorkStealingThreadPool();
 
-    size_t threadCount() const { return threadCount_; }
+    size_t threadCount() const { return threadCount_; }            // 总线程数（tick + 异步）
+    size_t tickThreadCount() const { return tickThreadCount_; }    // 服务 tick 任务的线程数（= 队列数）
+    size_t asyncThreadCount() const { return asyncThreadCount_; }  // 异步专用线程数（0 = 未预留）
 
     // 模板化提交：接受任意可调用对象，内部用 Fn 存储，无 std::function 分配
     template<typename F>
@@ -34,6 +43,23 @@ public:
         size_t idx = queueIdx % queues_.size();
         inFlight_.fetch_add(1, std::memory_order_relaxed);
         queues_[idx].enqueue(Fn{ std::forward<F>(task) });
+    }
+
+    // 异步泳道：异步体（匿名 work / SubmitMode::Async action）唯一的执行去处。
+    //   - 只有"会消费泳道的角色"取它：预留了异步线程时 = 异步角色；未预留（ratio=0）= 全体 worker。
+    //     **tick 角色与 run 线程都不碰它**（帮助执行 executeUpTo 与偷取 stealTask 只看 tick 队列），
+    //     否则 run 线程会在波次等待里把异步体捡回来跑，"异步不占用 tick 线程"立刻失效；
+    //   - 入队计入 inFlight_（全量清场用）与 asyncInFlight_（waitAsyncIdle/pendingAsyncWork）；
+    //   - 唤醒按批：仅当泳道此前没有待认领条目时 notify_all 一次（逐条唤醒会惊群）；
+    //   - 配套"有货绝不 park"闸门，见 ThreadPool.cpp 的 worker 循环。
+    template<typename F>
+    void enqueueAsync(F&& task) {
+        Fn fn{ std::forward<F>(task) };
+        inFlight_.fetch_add(1, std::memory_order_relaxed);
+        asyncInFlight_.fetch_add(1, std::memory_order_relaxed);
+        const bool wasIdle = asyncPending_.fetch_add(1, std::memory_order_acq_rel) == 0;
+        asyncQueue_.enqueue(std::move(fn));
+        if (wasIdle) wakeWorkers();
     }
 
     bool tryExecuteOne(size_t thiefIdx);
@@ -62,34 +88,60 @@ public:
         wakeGen_.notify_all();
     }
 
-    // 等待所有已入队任务完成（快照保存/恢复前清场用）
+    // 等待**全部**在途工作（tick 任务 + 异步体）完成（恢复/导入/回滚/析构前清场用）
     void waitIdle() {
         std::unique_lock lock(idleMutex_);
         idleCV_.wait(lock, [this] { return inFlight_.load(std::memory_order_acquire) == 0; });
     }
 
+    // 只等**异步体**结束（结果在返回前已写入队列）—— 公共 waitAsyncIdle() 的底层
+    void waitAsyncIdle() {
+        std::unique_lock lock(idleMutex_);
+        asyncIdleCV_.wait(lock, [this] { return asyncInFlight_.load(std::memory_order_acquire) == 0; });
+    }
+
+    // 在途异步体数（诊断/自检）
+    size_t pendingAsyncWork() const noexcept { return asyncInFlight_.load(std::memory_order_acquire); }
+
 private:
-    size_t threadCount_;
+    size_t threadCount_ = 0;
+    size_t tickThreadCount_ = 0;
+    size_t asyncThreadCount_ = 0;
     std::vector<std::thread> workers_;
-    std::vector<moodycamel::ConcurrentQueue<Fn>> queues_;   // 核心改动
+    std::vector<moodycamel::ConcurrentQueue<Fn>> queues_;   // tick 队列（每个 tick 线程一条）
+    moodycamel::ConcurrentQueue<Fn> asyncQueue_;            // 异步泳道（不进偷取集合）
+    std::atomic<size_t> asyncPending_{ 0 };                 // 已入泳道、未被认领的条目数（唤醒按批 + park 闸门）
     std::atomic<bool> stop_{ false };
-    std::atomic<size_t> inFlight_{ 0 };   // 已入队未完成（含 worker 正在执行）
+    std::atomic<size_t> inFlight_{ 0 };        // 已入队未完成（tick + 异步，含正在执行）
+    std::atomic<size_t> asyncInFlight_{ 0 };   // 已入队未完成的**异步体**（waitAsyncIdle 的判据）
     std::atomic<uint64_t> wakeGen_{ 0 };  // 事件驱动唤醒代数（见 wakeWorkers）
     std::mutex idleMutex_;
-    std::condition_variable idleCV_;
+    std::condition_variable idleCV_;       // inFlight_ → 0
+    std::condition_variable asyncIdleCV_;  // asyncInFlight_ → 0
 
     // worker 并发访问同一元素（thiefIdx 来自 roundRobin_ 轮转，非线程身份）→ 数据竞争。
 
     bool stealTask(size_t thiefIdx);
 
-    // 执行一个任务并维护在途计数（worker / 主线程帮助执行共用）
+    // 执行一个任务并维护在途计数（tick worker / 异步 worker / 主线程帮助执行共用）。
+    // 计数归零时**持锁**再 notify：谓词检查与递减之间存在"检查后通知前"的竞态（递减→通知都
+    // 发生在等待方阻塞之前 → 丢失唤醒）；持锁闭合它，且只在归零那一次触发，不在热路径上。
     void runTask(Fn& task) noexcept {
         try {
             task();
         }
         catch (...) { /* 兜底：策略未覆盖的异常不让其杀 worker */ }
         if (inFlight_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            std::lock_guard<std::mutex> lock(idleMutex_);
             idleCV_.notify_all();
+        }
+    }
+
+    // 异步体结束（在 runTask 之后调用：结果写入发生在任务体内部，故此刻"结果已入队"成立）
+    void noteAsyncDone() noexcept {
+        if (asyncInFlight_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            std::lock_guard<std::mutex> lock(idleMutex_);
+            asyncIdleCV_.notify_all();
         }
     }
 };

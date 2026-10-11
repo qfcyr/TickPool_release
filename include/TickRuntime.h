@@ -84,6 +84,10 @@ public:
     // ---------- ：action 异常的统一下报点 ----------
     void reportTaskException(Context& ctx, const std::exception& e, const char* phase);
 
+    // 异步结果边界发布：把每个异步任务的 staging 队列非阻塞地搬进可读队列（withAsyncResults 的读侧）。
+    // 调用点：executeTick 开头（每 tick 一次 → "tick N 提交的结果最早在 tick N+1 可见"）与 waitIdle()。
+    void publishAsyncResults() noexcept;
+
 private:
     ThreadPoolType& pool_;
     TickPool<Duration, OptionsT, ThreadPoolType>* owner_ = nullptr;

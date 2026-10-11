@@ -1,12 +1,9 @@
-TickPool 是面向 Tick 的确定性并行任务调度引擎 在设计完后使用deepseek开发 由于原始仓库被dsh搞的面目全非 特此开这个仓库
-
-
-# TickPool — 使用文档
+# TickPool — 使用文档（完整版）
 
 面向 Tick 的**确定性并行任务调度引擎**（C++20，头文件 + 两个 .cpp）。固定步长更新（Minecraft 风格）·
 DAG 自动波次并行 · 三阶段任务 · 异步结果回流 · 快照/恢复/回滚 · 网络同步通道（命令日志 + 世界传输）。
 
-> **本包信息**：**版本 1.0.0** · **MIT 许可证**（Copyright (c) 2026 ry w）。
+> **本包信息**：**版本 1.1.0** · **MIT 许可证**（Copyright (c) 2026 ry w）。
 > 许可全文见 `LICENSE`；版本规则、更新日志与第三方依赖许可见 `CHANGELOG.md`；
 > 机器可读版本号见 `VERSION`。本包按"原样"提供，不附带任何担保。
 >
@@ -199,7 +196,10 @@ lib/tickpool/
   `executeTick` 已过 → **静默丢弃**（这就是这条校验存在的原因）。
   框架内部的恢复/导入路径直接调 `Runtime::scheduleTick`，那里 `delay = 0` 仍有"下一个 tick 边界到期"
   的含义，不受该校验影响。
-- 异步提交**不看 `delay`**：它在调用线程立即执行、结果入队列。
+- 异步提交**不看 `delay`**：提交只把工作体投递到**异步泳道**后立即返回（泳道由"异步线程角色"消费；
+  默认不预留 → 全体 worker 共享；可用 `asyncThreadRatio` 预留专用线程，见 §6 配置 16）。结果稍后入队列，
+  并由 run 线程在 **tick 边界发布** —— **在 tick N 提交的异步结果，最早在 tick N+1 的 destruct 可见**。
+  也就是说异步**不是**"提交即完成"：需要确定性时用 `waitAsyncIdle()` 等它做完（§5.8）。
 - 相同输入 → 相同 tick 行为 → 相同结果（可重放）。这是快照/回滚/lockstep 的基础。
 
 ### 3.4 波次（自动并行度）
@@ -289,7 +289,7 @@ void options(TaskDesc desc);        // Commit：注册任务（同时校验依�
 | 调用时机 | **必须在 `run()` 之前**（定义期无锁：直接写注册表/队列表）。 |
 | 重名 | 同一个 `TaskKey` 注册两次 → `std::invalid_argument("defineTask: key ... already defined")`；同一任务内 action 全名重复也会抛。 |
 | `params = void` | 表示"无参数"，提交时用 `.work()`（内部是 `std::monostate`）。 |
-| `SubmitMode::Async` | 该 action 注册为**异步**：提交时在调用线程立即执行、结果入异步队列（不进延迟轮、不进快照）。 |
+| `SubmitMode::Async` | 该 action 注册为**异步**：提交时把工作体投递到**异步泳道**后立即返回，结果由 run 线程在 tick 边界发布（不进延迟轮、不进快照）。 |
 | 可调用形式 | `construct`/`destruct` 是**零参**可调用；action 经 `std::invoke` 分派 `(pool, payload)` / `(payload)` / `(pool)` / `()` —— 四种都支持，写不匹配的形式是**编译错误**。 |
 | 顺序无关 | 链上各步可以任意顺序（`construct` 在 `action` 前后都行）；`options()` 只能最后。 |
 | 惰性编译 | 首次 `run()`（或 `toMermaid()`）时才把定义编译成波次计划；依赖环、未注册依赖名在这一刻报错。 |
@@ -311,7 +311,7 @@ pool.defineTask("Physics")
 ```cpp
 SubmitBuilderBase submit(const TaskKey& key);        // key 立即解析：未注册 → std::out_of_range
 
-// --- 形态 A：匿名异步（无 .action()）：在调用线程立即执行，不进快照/命令日志 ---
+// --- 形态 A：匿名异步（无 .action()）：投递到异步泳道后立即返回，不进快照/命令日志 ---
 SubmitBuilderBase& options(SubmitOptions o);
 template<typename Callable> void work(Callable&& callable);
 
@@ -326,10 +326,10 @@ void work();                                          // 空 payload（Params = 
 // 并行（必须位于某个任务的 construct 上下文内）
 pool.submit("Physics").action("Step").options({ .delay = 1 }).work(i);
 
-// 异步 action（定义期标注了 SubmitMode::Async）—— 任意线程、立即执行
+// 异步 action（定义期标注了 SubmitMode::Async）—— 任意线程、投递后立即返回
 pool.submit("Physics").action("Load").work(ChunkReq{ 7 });
 
-// 匿名异步：任意线程、立即执行、不进快照/命令日志
+// 匿名异步：任意线程、投递后立即返回、不进快照/命令日志
 pool.submit("Loader").work([&] { return loadFromDisk(); });
 ```
 
@@ -497,12 +497,16 @@ LogicTime currentLogicTime() const noexcept;   WallTime currentWallTime() const;
 size_t tickCount() const noexcept;             size_t pendingAsyncResults(const TaskKey& key) const;
 AsyncQueueStats getAsyncQueueStats(const TaskKey& key) const;
 uint64_t dedupedSubmissions() const noexcept;  // 提交级去重折叠掉的提交数（进程内累计，不清零）
+void waitAsyncIdle();                          // 等全部在途异步体结束并发布结果（不得在 tick 回调内调用）
+size_t pendingAsyncWork() const noexcept;      // 在途异步体数（诊断/自检）
+void waitIdle();                               // 等**全部**在途工作（含 tick 任务）—— 清场/析构路径在用
 TickProfileSnapshot getProfile() const noexcept;   void resetProfile() noexcept;   // 需 TICKPOOL_ENABLE_PROFILE
 ```
 
 | 接口 | 备注 |
 | --- | --- |
 | `run(N)` | 阻塞到跑完 N 个 tick 或 `stop()`。`run(0)` 无限跑，直到 `stop()`。**必须专用线程**（Debug 下并发 `executeTick` 会断言）。`stop()` **不 join** 该线程。 |
+| `waitAsyncIdle()` | **异步的同步点**：返回时"该产出的异步结果都已写入队列"，紧接着一个 tick 就能全部取走。典型用法 `run(1)` → `waitAsyncIdle()` → `run(1)`。⚠ **不得在 tick 回调内调用**（会与 run 线程互相等待 → 抛 `std::runtime_error`）；⚠ 用户异步体永久阻塞时它会一直等（框架不会中断用户代码）。 |
 | `setTimeScale` | `0` = 暂停推进（tick 卡在第 5 步）；`<0.1` / `>2.0` 还会**改变异步合并策略**（见 §9 的非确定因素）。 |
 | `pause` / `resume` | `pause()` = `setTimeScale(0.0)`；**`resume()` = `setTimeScale(1.0)` —— 固定回 1.0，不是暂停前的值**（若你之前设了 0.5，pause→resume 后是 1.0）。两者都会触发 `onTimeScaleChange`（**即使值没变也会触发**）。 |
 | `currentWallTime()` | 返回 `{ steady_clock::now(), 当前 timeScale }` —— 注意它是**当前墙钟时刻**，不是本 tick 的墙钟目标；配合 tick 周期自己插值渲染。 |
@@ -559,6 +563,7 @@ TickProfileSnapshot getProfile() const noexcept;   void resetProfile() noexcept;
 | 13 | `onConstructException` | `Abort` | construct 抛异常策略：`Abort` / `LogAndContinue` / `Callback` |
 | 14 | `enableCommandLog` | `true`（`TICKPOOL_ENABLE_NETWORK=0` 时强制 false） | 命令日志（lockstep 输入）开关 |
 | 15 | `inlineWaveMaxTasks` | `TICKPOOL_INLINE_WAVE_MAX_TASKS` = `1` | 小波次内联阈值（`0` = 关闭内联） |
+| 16 | `asyncThreadRatio` | `TICKPOOL_ASYNC_THREAD_RATIO` = `0.0` | **异步专用线程比例**（0..1）：`0` = 不预留（默认；异步体与 tick 任务共享全部 worker 线程）；`>0` = 预留 `round(N × ratio)` 条线程（clamp 到 `[1, N-1]`）**只服务异步泳道**，其余线程做 tick 任务 —— 长异步体因此不会占住 tick 的 worker。异步线程空闲时可**单向帮忙** tick 队列；**tick 线程永不消费异步泳道**（"异步不占用 tick 线程/run 线程"不因预留改变）。⚠ 线程数 < 2 且 `ratio > 0` → 池构造抛 `std::invalid_argument`（不静默退化） |
 
 ```cpp
 struct MyOpts : DefaultTickPoolOptions {
@@ -634,7 +639,7 @@ TickPool<std::chrono::milliseconds, MyOpts> pool(20ms);
 | `run()` / `executeTick` | **唯一专用线程**；Debug 下并发 `executeTick` 会断言 |
 | construct / 并行 action | worker 线程池（小波次内联时改由 run 线程） |
 | destruct（`Sequential`）/ `onTickBegin` / `onTickEnd` | run 线程 |
-| 匿名异步 `submit().work(callable)`、异步 action | **任意线程**（在调用线程立即执行） |
+| 匿名异步 `submit().work(callable)`、异步 action | **任意线程**（提交只入队；工作在**异步泳道线程**上做 —— 预留了异步角色时是专用线程，未预留时是共享 worker） |
 | `stop` / `setTimeScale` / `pause` / `resume` / `isPaused` / `timeScale` | 任意线程（原子 + 条件变量通知） |
 | `tickCount` / `pendingAsyncResults` / `getAsyncQueueStats` / `dedupedSubmissions` / `getProfile` | 任意线程 |
 | `executionPlan` / `taskRegistry` / `toMermaid` | 任意线程只读（`toMermaid` 会触发惰性编译，建议定义完成、`run()` 前调用） |
@@ -643,7 +648,14 @@ TickPool<std::chrono::milliseconds, MyOpts> pool(20ms);
 | `exportPoolData` / `exportWorldState` | 任意线程，**但不得在 tick 回调内**（会抛错）；会阻塞到在途 tick 结束 |
 | `importSnapshot` / `loadPoolState` / `importPoolData` / `importWorldState` / `loadSnapshotFromFile` / `rollbackTo` / `rollbackLast` / `fromString` | **tick 边界**（`stop()` 之后最安全）；**tick 回调内一律抛错**；运行中从非 run 线程 = Debug 断言 |
 | `importCommands` | **tick 边界前**；tick 内注入"目标 = 当前 tick"的命令会抛错 |
+| `waitAsyncIdle` | 任意线程（**tick 回调内抛错**）；等全部在途异步体结束 |
 | `exportSnapshot` / `savePoolState` / `toString` / `saveSnapshotToFile` | **tick 边界**（它们会 drain 短延迟环再放回；运行中从别的线程调用没有 `tickGate_` 保护 → 请只在边界用） |
+
+> **异步的安全点**：`waitAsyncIdle()` 返回时"该产出的异步结果都已写入队列"，再跑 1 个 tick 就能在
+> destruct 里全部取走。**tick 回调内调用会抛错**（守卫 `engine_test` N16h）—— 理由不是死锁
+> （异步体不依赖 tick），而是它会**把结果提前发布**、破坏"tick N 提交 → 最早 tick N+1 可见"这条
+> 边界规则。想在 destruct 里"等异步全回来"是**不行的**（那正是内联波次下阻塞 run() 的老问题）：
+> 正确做法是下一 tick 再取，或由外部在 `run()` 之外 `waitAsyncIdle()`。
 
 ### 7.2 导入/回滚安全点：为什么必须抛错
 
@@ -733,11 +745,12 @@ TickPool<std::chrono::milliseconds, MyOpts> pool(20ms);
 | `DropOldest`（**默认**）/ `DropNewest` | 队列满时丢哪条取决于时序 → **跨运行结果不确定**。lockstep 请用充足容量或 `Block`（或让异步不参与逻辑） |
 | `Block` | 不丢，但阻塞提交线程 → 时序改变、抖动放大 |
 | `timeScale` 变化 | 除改变墙钟节奏外，还会**改写异步合并策略**（`<0.1` 与 `>2.0` 触发不同配额/阈值，且写入是**粘性**的、不会自动恢复）→ 批次内容与"是否去重"随时钟变化 |
-| 跨线程异步提交 | 异步在提交线程立即执行并取 `seq` → `seq → 工作` 的对应关系取决于线程调度（异步不进命令日志，但也别用它承载必须一致的逻辑） |
+| 跨线程异步提交 | 异步在提交点取 `seq`、工作体在**异步泳道线程**上执行 → `seq → 工作` 的对应关系取决于线程调度（异步不进命令日志，但也别用它承载必须一致的逻辑）。**结果到达的 tick 由"何时完成 + 边界发布"决定**，需要确定性时用 `waitAsyncIdle()` 对账 |
 | 小波次内联 | 该波次改由 run 线程串行执行 → `OverlapParallel` 退化为顺序（调度形状变化，但提交序仍是确定的） |
 | 提交级去重（`hash`） | **串行提交**（典型情形：某任务自己的 construct，单线程跑完）→ 存活者 = **最先提交**的那条，完全确定。**并发提交同一个键**（同一任务的多个子任务里提交 / `OverlapParallel` 析构并发提交 / 跨线程异步提交）→ 存活者取决于去重锁的获取顺序 → **非确定**。注意：去重判定发生在 `seq` 分配**之前**，被折叠的那条**从不分配 seq** —— 所以"seq 最小者胜出"在实现上恒成立（只有胜者拿到 seq），真正不确定的是**哪条 payload 活下来** |
 | 用户 `hasher`/`equal` + 状态化去重 | 结果回填顺序依赖哈希表迭代序 → 若你的回调对顺序敏感，请只依赖"集合内容"而不是顺序 |
 | 「谁先执行」 | **不应**被观察：结果按 seq 排序交付，构造相同波次并发但提交序确定 |
+| **异步结果到达时机** | 异步体在异步泳道线程上跑、结果在 **tick 边界发布** → **最早在提交后的下一个 tick 可见**（提交于 tick N → tick N+1 的 destruct 起可读）；**慢异步体顺延**到更后面的边界（"第几个 tick 取到"因此仍取决于它何时跑完）。若 destruct 依赖"这一 tick 一定能取到刚提交的结果"，请用 `waitAsyncIdle()`（tick 之外）显式对账 |
 
 ### 9.3 lockstep 检查清单
 
@@ -875,6 +888,9 @@ World:    magic[16]="TICKPOOL_WORLDV1" | protocolVersion u32=1 | schemaVersion u
 2. **并行提交必须发生在构造相**才有确定提交序；`delay` 必须 ≥ 1（`delay = 0` 抛错，§3.3）。
 3. **`delay` 与目标 tick 的语义**：目标 tick = 提交时的 tick + `delay`；轮内记录的是**绝对 tick**。
 4. **异步提交不看 `delay`**；异步结果**永不进快照**，恢复后异步队列被清空。
+   异步体在**异步泳道线程**上执行（提交只入队即返回），结果由 run 线程在 **tick 边界发布** →
+   提交于 tick N 的结果最早在 tick N+1 可见；需要确定性用 `waitAsyncIdle()`（tick 之外调用）。
+   可用 `asyncThreadRatio` 给异步预留专用线程（默认不预留，与 tick 共享 worker）。
 5. **`seq` 不入快照**（恢复后重新分配）。
 6. **超预算不追赶**：执行超 tick 预算时本 tick 变慢但不累积欠账（逻辑时间轴必须"一次 `executeTick`
    恰好推进一个 tick"；按墙钟追赶会让 tick 序列变成机器速度的函数）。
@@ -894,7 +910,7 @@ World:    magic[16]="TICKPOOL_WORLDV1" | protocolVersion u32=1 | schemaVersion u
 
 **异常与错误**
 
-16. **并行/异步 action 抛异常会被上报、不杀进程**：写 `stderr` → `onTaskException`（若注册）→ 跳过该子任务的结果 → 继续本 tick。它**不看** `onConstructException`；若要"异常即停"请在回调里自己停（§8.3）。⚠ 匿名异步 `submit().work(callable)` 的 callable 是**在你调用它的线程上直接执行**的，它抛出的异常按普通 C++ 调用语义**传播给调用方**（不经过这条上报路径）。
+16. **并行/异步 action 抛异常会被上报、不杀进程**：写 `stderr` → `onTaskException`（若注册）→ 跳过该子任务的结果 → 继续本 tick。它**不看** `onConstructException`；若要"异常即停"请在回调里自己停（§8.3）。⚠ **`onTaskException` 可能从异步执行器线程被调用** —— 回调里碰共享状态必须自己加锁。⚠ 匿名异步 `submit().work(callable)` 的 callable 在**异步执行器线程**上执行，异常同样走这条上报路径（不再"抛给调用方"）。
 17. **`LogAndContinue` 与 `Callback` 当前实现等价**（都继续执行）。
 18. **`asyncBackpressure = Assert` 不会因队列满而断言**（检查的是函数指针），仍会静默丢弃。
 19. **`DropOldest`/`DropNewest` 跨运行结果不确定** → lockstep 规避。
@@ -1196,7 +1212,12 @@ A：默认 `TICKPOOL_ENABLE_NETWORK=1`，网络 codec 在任务定义时就实�
 A：被**接住并上报**：写 `stderr` → 调 `onTaskException`（若注册）→ 跳过该子任务的结果 → **继续本 tick**，进程不死（§8.3）。
 它不看 `onConstructException`（那条策略是 construct 专用的）；要"异常即停"就在回调里 `stop()`/`abort()`。
 construct/destruct 的异常则走 `onConstructException` 策略 + `onTaskException`。
-另外：**匿名异步 `submit().work(callable)`** 的 callable 直接在你调用它的线程上执行，异常按普通 C++ 语义**抛给调用方**。
+另外：**匿名异步 `submit().work(callable)`** 的 callable 在**异步泳道线程**上执行，异常同样被上报（不杀进程、不抛给提交方）。
+
+**Q：为什么我提交完异步、下一个 tick 里取不到结果？**
+A：异步体在**异步泳道**上跑，提交只入队即返回，结果由 run 线程在 **tick 边界发布** —— 提交于 tick N 的
+结果**最早在 tick N+1** 可见（慢异步体顺延）。需要确定性时用 `pool.run(1)` → `pool.waitAsyncIdle()` →
+`pool.run(1)`（在 `run()` 之外等，**不能**在 destruct 里等：那是 tick 内，会抛错）。
 
 **Q：`onTickEnd` 里 `tickCount()` 为什么比构造时大 1？**
 A：`tickCount` 在本 tick 的收尾（墙钟对齐之后）自增，`onTickEnd` 用**递增后**的值调用。
@@ -1214,7 +1235,10 @@ A：先确认注册过 `setWorldHash` —— 没注册时它恒返回 0。
 
 **Q：能不能不用线程池（单线程跑）？**
 A：`TickPool(Duration, std::unique_ptr<ThreadPoolType>)` 可以注入自建池；但线程池类型必须满足库内的概念
-约束（`enqueue` / `waitIdle` / `threadCount` / `executeUpTo` 等）。
+约束（`enqueue` / `enqueueAsync` / `wakeWorkers` / `waitIdle` / `waitAsyncIdle` / `pendingAsyncWork` /
+`executeUpTo` / `tryExecuteOne` / `threadCount`）。
+若你的池支持 `(线程数, 异步比例)` 构造，框架会把 `options.asyncThreadRatio` 传给它；否则回退默认构造
+（此时线程角色划分由你的池自己负责）。
 
 **Q：为什么性能基准必须用 `NDEBUG`？**
 A：Debug 下 `TICKPOOL_ENABLE_STATS/_TYPE_CHECK/_PROFILE` 默认为 1 —— 每个子任务多付原子操作与类型比对，

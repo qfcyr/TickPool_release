@@ -71,9 +71,21 @@ void TickRuntime<Duration, OptionsT, ThreadPoolType>::reportTaskException(
 }
 
 // ========== 线程队列索引 ==========
+// 返回**单调轮转计数**（不取模）：取模由 ThreadPool::enqueue/executeUpTo 按"tick 队列数"做，
+// 这样索引与线程数解耦 —— 线程被划分角色后（tick 线程数 < 总线程数）也天然均匀。
 template<TickDuration Duration, typename OptionsT, ThreadPool ThreadPoolType>
 size_t TickRuntime<Duration, OptionsT, ThreadPoolType>::getThreadQueueIndex() const {
-    return state_.roundRobin_.fetch_add(1, std::memory_order_relaxed) % pool_.threadCount();
+    return state_.roundRobin_.fetch_add(1, std::memory_order_relaxed);
+}
+
+// 异步结果边界发布（把 staging 搬进可读队列）。只在 run 线程上调用（tick 边界 / waitIdle）。
+// 搬运的是"取出当时已在 staging 的条目"—— 边界之后才完成的异步体自然落到下一个边界。
+template<TickDuration Duration, typename OptionsT, ThreadPool ThreadPoolType>
+void TickRuntime<Duration, OptionsT, ThreadPoolType>::publishAsyncResults() noexcept {
+    for (TaskID asyncId : state_.asyncTaskIds_) {
+        TaskAsyncHot& ah = state_.asyncHotTable_[asyncId];
+        if (ah.asyncPublish) ah.asyncPublish(ah, ah.asyncStagingRaw, state_.tickHotTable_[asyncId].asyncQueueRaw);
+    }
 }
 
 // ========== Arena 分配器 ==========
@@ -217,7 +229,7 @@ void TickRuntime<Duration, OptionsT, ThreadPoolType>::submitAsync(
     TaskID id, TaskFunc&& task, const SubmitOptions& opts) {
 
     // 提交级去重（匿名异步也覆盖；无 payload → 强度只能到 Aggressive，
-    // Conservative 因无从做值确认而**不去重**）。目标 tick 取当前 tick —— 本线程立即执行。
+    // Conservative 因无从做值确认而**不去重**）。目标 tick 取当前 tick（提交时刻）。
     if (opts.hash) {
         const uint64_t nowTick = state_.tickCount_.load(std::memory_order_acquire);
         if (!submitDedupCheck(id, kAnonymousSubmitActionId, nowTick,
@@ -229,78 +241,105 @@ void TickRuntime<Duration, OptionsT, ThreadPoolType>::submitAsync(
     // 异步合并的提交期覆盖（仅显式设置时触碰）
     if (opts.enableAsyncMerge) noteAsyncMergeOverride(id, *opts.enableAsyncMerge);
 
-    TaskTickHot& tick = state_.tickHotTable_[id];
-    TaskAsyncHot& async = state_.asyncHotTable_[id];
-    void* typedQueuePtr = tick.asyncQueueRaw;
+    // 热数据**按值快照**（队列指针与入队函数在 defineTask 时确定、运行期不变），
+    // 这样延迟执行的闭包不依赖表扩容后的稳定性。
+    const TaskAsyncHot ops = state_.asyncHotTable_[id];
+    void* stagingPtr = ops.asyncStagingRaw;   // 生产者侧队列：tick 边界由 run 线程发布到可读队列
 
-    // 只在 Assert 错误分支按需读取。
+    // 只在 Assert 错误分支按需读取 cold 表。
 
-    // 根据背压策略选择入队函数
+    // 根据背压策略选择入队函数。seq 仍在**提交时**分配 —— 结果顺序只由 seq 决定
+    // （读侧按 seq 排序），与执行线程、完成时刻无关。
     const uint64_t seq = allocSeq();
-    auto enqueueResult = [&](auto&& result) {
-        if constexpr (std::is_void_v<std::remove_reference_t<decltype(result)>>) {
+    const uint64_t submitTick = state_.tickCount_.load(std::memory_order_acquire);
+
+    // 异步体投递到**异步泳道**（不在调用线程执行）：提交方只打包 + 入队 + 唤醒；
+    // 异步体由 worker 取出执行，结果写 staging，run 线程在 tick 边界发布。
+    auto runBody = [this, id, seq, submitTick, stagingPtr, ops,
+                    task = std::forward<TaskFunc>(task)]() mutable {
+        using ResultType = decltype(task());
+        Context ctx;
+        ctx.pool = owner_;
+        ctx.tick = submitTick;   // 提交时刻的 tick（不是执行时刻）
+        ctx.taskId = id;
+        ctx.seq = seq;
+
+        // void 结果走**独立分支**：不能用 `enqueueResult(nullptr)` 之类把类型退化成 nullptr_t 的写法
+        // （那会落进"值"分支去调 void 任务并未设置的 asyncEnqueue* 指针 → 结果被静默丢弃）。
+        auto enqueueVoidResult = [&]() {
             switch (options.asyncBackpressure) {
             case AsyncBackpressurePolicy::DropOldest:
-                if (async.asyncEnqueueVoidForce) async.asyncEnqueueVoidForce(typedQueuePtr, seq);
+                if (ops.asyncEnqueueVoidForce) ops.asyncEnqueueVoidForce(stagingPtr, seq);
                 break;
             case AsyncBackpressurePolicy::Block:
                 // 真阻塞（队列满时让出 CPU 重试，不静默丢弃）
-                while (!async.asyncEnqueueVoidBlocking) std::this_thread::yield();
-                async.asyncEnqueueVoidBlocking(typedQueuePtr, seq);
+                while (!ops.asyncEnqueueVoidBlocking) std::this_thread::yield();
+                ops.asyncEnqueueVoidBlocking(stagingPtr, seq);
                 break;
             case AsyncBackpressurePolicy::Assert: {
-                bool ok = async.asyncEnqueueVoid != nullptr;
+                bool ok = ops.asyncEnqueueVoid != nullptr;
                 if (!ok) {
                     const TaskColdData& coldErr = state_.coldTable_[id];
                     std::cerr << "[TickPool] Async queue full on task \"" << (coldErr.debugName.empty() ? "unnamed" : coldErr.debugName.c_str()) << "\"" << std::endl;
                     assert(false && "Async queue capacity exceeded");
                 }
-                async.asyncEnqueueVoid(typedQueuePtr, seq);
+                ops.asyncEnqueueVoid(stagingPtr, seq);
                 break;
             }
             default: // DropNewest 或其他：失败即丢弃
-                if (async.asyncEnqueueVoid) async.asyncEnqueueVoid(typedQueuePtr, seq);
+                if (ops.asyncEnqueueVoid) ops.asyncEnqueueVoid(stagingPtr, seq);
                 break;
             }
-        }
-        else {
+        };
+        auto enqueueValueResult = [&](auto& result) {
+            const void* resultPtr = static_cast<const void*>(&result);
             switch (options.asyncBackpressure) {
             case AsyncBackpressurePolicy::DropOldest:
-                if (async.asyncEnqueueForce)
-                    async.asyncEnqueueForce(typedQueuePtr, const_cast<void*>(static_cast<const void*>(&result)), seq);
+                if (ops.asyncEnqueueForce)
+                    ops.asyncEnqueueForce(stagingPtr, const_cast<void*>(resultPtr), seq);
                 break;
             case AsyncBackpressurePolicy::Block:
                 // 真阻塞（队列满时让出 CPU 重试，不静默丢弃）
-                while (!async.asyncEnqueueBlocking) std::this_thread::yield();
-                async.asyncEnqueueBlocking(typedQueuePtr, const_cast<void*>(static_cast<const void*>(&result)), seq);
+                while (!ops.asyncEnqueueBlocking) std::this_thread::yield();
+                ops.asyncEnqueueBlocking(stagingPtr, const_cast<void*>(resultPtr), seq);
                 break;
             case AsyncBackpressurePolicy::Assert: {
-                bool ok = async.asyncEnqueue != nullptr;
+                bool ok = ops.asyncEnqueue != nullptr;
                 if (!ok) {
                     const TaskColdData& coldErr = state_.coldTable_[id];
                     std::cerr << "[TickPool] Async queue full on task \"" << (coldErr.debugName.empty() ? "unnamed" : coldErr.debugName.c_str()) << "\"" << std::endl;
                     assert(false && "Async queue capacity exceeded");
                 }
-                async.asyncEnqueue(typedQueuePtr, const_cast<void*>(static_cast<const void*>(&result)), seq);
+                ops.asyncEnqueue(stagingPtr, const_cast<void*>(resultPtr), seq);
                 break;
             }
             default: // DropNewest 及其他
-                if (async.asyncEnqueue)
-                    async.asyncEnqueue(typedQueuePtr, const_cast<void*>(static_cast<const void*>(&result)), seq);
+                if (ops.asyncEnqueue)
+                    ops.asyncEnqueue(stagingPtr, const_cast<void*>(resultPtr), seq);
                 break;
             }
+        };
+
+        // 异步体的异常**没有调用方可以抛给**（提交方早已返回）→ 一律接住并上报，与 worker 提交一致。
+        try {
+            if constexpr (std::is_void_v<ResultType>) {
+                task();
+                enqueueVoidResult();
+            }
+            else {
+                auto result = task();
+                enqueueValueResult(result);
+            }
+        }
+        catch (const std::exception& e) {
+            reportTaskException(ctx, e, "async task");
+        }
+        catch (...) {
+            const std::runtime_error unknown("Unknown exception");
+            reportTaskException(ctx, unknown, "async task");
         }
     };
-
-    using ResultType = decltype(task());
-    if constexpr (std::is_void_v<ResultType>) {
-        task();
-        enqueueResult(nullptr);
-    }
-    else {
-        auto result = task();
-        enqueueResult(result);
-    }
+    pool_.enqueueAsync(std::move(runBody));
 }
 
 // ========== withParallelBuffer / withParallelBuffers ==========
@@ -684,6 +723,12 @@ void TickRuntime<Duration, OptionsT, ThreadPoolType>::executeTick() {
         TICKPOOL_PROFILE_SCOPE(TICKPOOL_PROF_ACC(wheelNs));
         processDelayedWheel(current);
     }
+
+    // 异步结果**边界发布**：泳道线程把结果写进 per-task staging，这里（每个 tick 开头、任何用户
+    // 回调之前）把它搬进可读队列。规则：**在 tick N 提交的异步结果最早在 tick N+1 的回调可见**；
+    // 只搬运"本边界之前已完成"的条目 → 慢异步体顺延，且与同 tick 的 destruct 无时序竞争。
+    publishAsyncResults();
+
     auto& tasksByOwner = tasksByOwnerBuf_;   // 跨 tick 复用的按-owner 分组 buffer
 
     // tick 边界回调（合成上下文：pool + tick，taskId 无效）

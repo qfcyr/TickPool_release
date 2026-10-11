@@ -36,6 +36,19 @@
 #  define TICKPOOL_ENABLE_NETWORK 1
 #endif
 
+// 小波次内联阈值（见 DefaultTickPoolOptions::inlineWaveMaxTasks）
+#ifndef TICKPOOL_INLINE_WAVE_MAX_TASKS
+#  define TICKPOOL_INLINE_WAVE_MAX_TASKS 1
+#endif
+
+// TICKPOOL_ASYNC_THREAD_RATIO —— 异步专用线程比例（0..1，见 DefaultTickPoolOptions）。
+//   0   = 不预留（默认）：异步体与 tick 任务共享全部 worker 线程；
+//   >0  = 预留 round(N × ratio) 条线程只服务异步泳道（至少 1 条，且至少留 1 条给 tick）。
+// 线程角色构造期定死：总线程数不变、不新增线程。
+#ifndef TICKPOOL_ASYNC_THREAD_RATIO
+#  define TICKPOOL_ASYNC_THREAD_RATIO 0.0
+#endif
+
 // ========== Duration 合法性 ==========
 // 约束：**被支持的最大时间单位必须是 Duration(1) 的整数倍**（即 Duration 整除该单位）。
 inline constexpr std::chrono::hours kMaxSupportedTimeUnit{ 24 };   // 1 天

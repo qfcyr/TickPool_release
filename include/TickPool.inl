@@ -15,9 +15,25 @@
 #include <rapidjson/writer.h>
 
 // ========== 构造/析构 ==========
+// 默认线程池：把 `options.asyncThreadRatio` 传给它（线程角色构造期定死）。
+// 自定义线程池若支持 (线程数, 异步比例) 构造则同样收到该参数，否则回退默认构造（角色划分自理）。
+template<TickDuration Duration, typename OptionsT, ThreadPool ThreadPoolType>
+std::unique_ptr<ThreadPoolType> TickPool<Duration, OptionsT, ThreadPoolType>::makeDefaultThreadPool() {
+    // 编译期边界：比例必须落在 [0,1]（越界是配置错误 → 直接编译失败，好过运行期悄悄退化）
+    static_assert(options.asyncThreadRatio >= 0.0 && options.asyncThreadRatio <= 1.0,
+        "asyncThreadRatio must be in [0, 1] (0 = no reservation, 1 = reserve all threads but one)");
+    if constexpr (std::is_constructible_v<ThreadPoolType, size_t, double>) {
+        return std::make_unique<ThreadPoolType>(std::thread::hardware_concurrency(),
+                                                options.asyncThreadRatio);
+    }
+    else {
+        return std::make_unique<ThreadPoolType>();
+    }
+}
+
 template<TickDuration Duration, typename OptionsT, ThreadPool ThreadPoolType>
 TickPool<Duration, OptionsT, ThreadPoolType>::TickPool(Duration tickDuration)
-    : threadPool_(std::make_unique<ThreadPoolType>()),
+    : threadPool_(makeDefaultThreadPool()),
     runtime_(*threadPool_, tickDuration),
     tickDuration_(tickDuration) {
     runtime_.attachOwner(this);
@@ -32,7 +48,14 @@ TickPool<Duration, OptionsT, ThreadPoolType>::TickPool(Duration tickDuration, st
     runtime_.state().startWallTime_ = std::chrono::steady_clock::now();
 }
 template<TickDuration Duration, typename OptionsT, ThreadPool ThreadPoolType>
-TickPool<Duration, OptionsT, ThreadPoolType>::~TickPool() { stop(); }
+TickPool<Duration, OptionsT, ThreadPoolType>::~TickPool() {
+    stop();
+    // 真异步之后，异步体可能在 run() 返回之后仍在飞（这正是"不阻塞调用方"的代价）。析构必须先把
+    // 在途工作（含异步泳道）排空再做成员析构 —— 成员析构顺序是 actionRegistry_ → … → runtime_ →
+    // threadPool_，不等的话泳道线程会写进已释放的 staging 队列。用户侧同理：异步体引用的对象
+    // 必须活到池析构之后。
+    threadPool_->waitIdle();
+}
 
 // ========== 任务注册（V2：Builder Commit 调用；行为与配置分离） ==========
 template<TickDuration Duration, typename OptionsT, ThreadPool ThreadPoolType>
@@ -119,6 +142,42 @@ void TickPool<Duration, OptionsT, ThreadPoolType>::registerTask(
         auto* q = static_cast<TypedAsyncQueue<AsyncItem, options.asyncQueueCapacity>*>(typedQueuePtr);
         return q->dropOne();
     };
+
+    // ---------- 异步暂存队列（泳道写出） + tick 边界发布 ----------
+    // 生产者（泳道线程）只写 staging；消费者（run 线程的 destruct）只读可读队列；中间由 run 线程
+    // 在每个 tick 开头搬一次。两条队列都满足 MPSCQueue 的"多生产者 + 单消费者"要求
+    // （staging 的消费者是发布遍历；可读队列的生产者只有发布遍历 —— 都是单消费者）。
+    using StagingQueue = TypedAsyncQueue<AsyncItem, options.asyncQueueCapacity>;
+    auto staging = std::make_unique<StagingQueue>();
+    void* stagingRaw = staging.release();
+    async.asyncStagingRaw = runtime_.state().bufferRegistry_.add(
+        std::unique_ptr<void, void(*)(void*)>(stagingRaw, &TypedQueueDeleter<StagingQueue>));
+    // 滞留槽（容量 1 条）：发布时若可读队列没空间，就把这一条留在这里，下个边界优先搬它 ——
+    // 保证 Block 背压"永不丢"的承诺不因发布侧容量不足而破。
+    async.asyncCarryRaw = runtime_.state().bufferRegistry_.add(
+        std::unique_ptr<void, void(*)(void*)>(new AsyncItem, &TypedQueueDeleter<AsyncItem>));
+    async.asyncCarryPending = false;
+    async.asyncPublish = [](TaskAsyncHot& hot, void* stagingPtr, void* visiblePtr) noexcept {
+        auto* src = static_cast<StagingQueue*>(stagingPtr);
+        auto* dst = static_cast<StagingQueue*>(visiblePtr);
+        if (!src || !dst) return;
+        auto* carry = static_cast<AsyncItem*>(hot.asyncCarryRaw);
+        // 1) 先搬上一边界滞留的那条（优先，保证不饿死）
+        if (hot.asyncCarryPending) {
+            if (!dst->tryEnqueue(std::move(*carry))) return;   // 仍没空间 → 继续滞留
+            hot.asyncCarryPending = false;
+        }
+        // 2) 再从 staging 尽量搬：**非阻塞**入队；没空间就停下（剩下的留到下个边界）
+        AsyncItem item;
+        while (src->tryDequeue(item)) {
+            if (!dst->tryEnqueue(std::move(item))) {
+                *carry = std::move(item);
+                hot.asyncCarryPending = true;
+                break;
+            }
+        }
+    };
+    runtime_.state().asyncTaskIds_.push_back(id);   // 边界发布清单
 
     // ---------- 并行结果队列 ----------
     using ParallelItem = std::conditional_t<options.enableDeterministicOrdering,
@@ -221,24 +280,30 @@ void TickPool<Duration, OptionsT, ThreadPoolType>::submitWithAction(
         }
         // 异步合并的提交期覆盖（仅显式设置时触碰）
         if (opts.enableAsyncMerge) runtime_.noteAsyncMergeOverride(id, *opts.enableAsyncMerge);
-        void* asyncQueue = state.tickHotTable_[id].asyncQueueRaw;
+        // 异步 action 同样**不在调用线程执行** —— payload 与上下文移进闭包，投递到异步泳道。
+        // 结果写进该任务的 staging 队列，由 run 线程在 tick 边界发布。
+        void* asyncQueue = state.asyncHotTable_[id].asyncStagingRaw;
         Context ctx;
         ctx.pool = this;
         ctx.tick = state.tickCount_.load(std::memory_order_acquire);
         ctx.taskId = id;
         ctx.seq = allocSeq();
+        auto* registry = &actionRegistry_;
 
         // 语义与并行子任务一致：报告 + 不产出结果 + 返回；不中断调用方、不杀进程。
-        try {
-            actionRegistry_.executeAsync(actionId, ctx, static_cast<const void*>(p.get()), asyncQueue);
-        }
-        catch (const std::exception& e) {
-            runtime_.reportTaskException(ctx, e, "async action");
-        }
-        catch (...) {
-            const std::runtime_error unknown("Unknown exception");
-            runtime_.reportTaskException(ctx, unknown, "async action");
-        }
+        threadPool_->enqueueAsync(
+            [this, registry, actionId, ctx, asyncQueue, p = std::move(p)]() mutable {
+                try {
+                    registry->executeAsync(actionId, ctx, static_cast<const void*>(p.get()), asyncQueue);
+                }
+                catch (const std::exception& e) {
+                    runtime_.reportTaskException(ctx, e, "async action");
+                }
+                catch (...) {
+                    const std::runtime_error unknown("Unknown exception");
+                    runtime_.reportTaskException(ctx, unknown, "async action");
+                }
+            });
         return;
     }
 
@@ -319,7 +384,10 @@ AsyncQueueStats TickPool<Duration, OptionsT, ThreadPoolType>::getAsyncQueueStats
     const TaskAsyncHot& async = state.asyncHotTable_[id];
     const TaskColdData& cold = state.coldTable_[id];
     AsyncQueueStats stats;
-    stats.pendingResults = async.asyncSize ? async.asyncSize(tick.asyncQueueRaw) : 0;
+    // pending = 暂存（泳道已产出、尚未到边界）+ 可读（已发布、尚未被 destruct 读走）+ 滞留
+    stats.pendingResults = async.asyncSize
+        ? (async.asyncSize(tick.asyncQueueRaw) + async.asyncSize(async.asyncStagingRaw)
+           + (async.asyncCarryPending ? 1u : 0u)) : 0;
 #if TICKPOOL_ENABLE_STATS
     stats.mergedResults = cold.mergedResults.load(std::memory_order_relaxed);
     stats.droppedResults = cold.droppedResults.load(std::memory_order_relaxed);
@@ -397,7 +465,32 @@ void TickPool<Duration, OptionsT, ThreadPoolType>::run(size_t tickCount) {
     }
 }
 template<TickDuration Duration, typename OptionsT, ThreadPool ThreadPoolType>
+void TickPool<Duration, OptionsT, ThreadPoolType>::waitAsyncIdle() {
+    // 边界发布规则：结果只在 tick 边界可见。在 tick 回调内等异步会把结果提前发布 → 明确报错，
+    // 不静默改变语义（与导入安全点守卫同一取舍）。
+    if (TickRuntime<Duration, OptionsT, ThreadPoolType>::inTick())
+        throw std::runtime_error("waitAsyncIdle: cannot be called from inside a tick callback — "
+            "it would publish staged async results mid-tick and break the boundary rule; "
+            "call it between ticks (after run() returns) or after stop()");
+    threadPool_->waitAsyncIdle();
+    runtime_.publishAsyncResults();   // 等完再发布：返回时结果确实"可读"
+}
+
+template<TickDuration Duration, typename OptionsT, ThreadPool ThreadPoolType>
+size_t TickPool<Duration, OptionsT, ThreadPoolType>::pendingAsyncWork() const noexcept {
+    return threadPool_->pendingAsyncWork();
+}
+
+template<TickDuration Duration, typename OptionsT, ThreadPool ThreadPoolType>
 void TickPool<Duration, OptionsT, ThreadPoolType>::stop() { runtime_.state().running_.store(false, std::memory_order_release); runtime_.state().timeCV_.notify_all(); }
+
+template<TickDuration Duration, typename OptionsT, ThreadPool ThreadPoolType>
+void TickPool<Duration, OptionsT, ThreadPoolType>::waitIdle() {
+    // 顺序不能反：先等在途工作（含异步泳道）结束，再发布暂存结果 —— 反了会先搬一次"还没跑完的"，
+    // 返回之后仍可能有新结果落地。
+    threadPool_->waitIdle();
+    runtime_.publishAsyncResults();
+}
 
 // ========== 时间控制 ==========
 template<TickDuration Duration, typename OptionsT, ThreadPool ThreadPoolType>
@@ -456,7 +549,10 @@ size_t TickPool<Duration, OptionsT, ThreadPoolType>::pendingAsyncResults(const T
     TaskID id = getTaskID(key);
     const TaskTickHot& tick = state.tickHotTable_[id];
     const TaskAsyncHot& async = state.asyncHotTable_[id];
-    return async.asyncSize ? async.asyncSize(tick.asyncQueueRaw) : 0;
+    // 暂存 + 可读 + 滞留都算"待读回"（暂存的条目会在下一个 tick 边界被发布）
+    return async.asyncSize
+        ? (async.asyncSize(tick.asyncQueueRaw) + async.asyncSize(async.asyncStagingRaw)
+           + (async.asyncCarryPending ? 1u : 0u)) : 0;
 }
 
 // ========== 序列化 ==========
@@ -703,7 +799,9 @@ SnapshotData TickPool<Duration, OptionsT, ThreadPoolType>::buildSnapshotData(boo
         SnapshotTaskInfo info;
         info.key = taskRegistry_.idToKeyAt(id);
         info.pendingAsync = state.asyncHotTable_[id].asyncSize
-            ? state.asyncHotTable_[id].asyncSize(state.tickHotTable_[id].asyncQueueRaw) : 0;
+            ? (state.asyncHotTable_[id].asyncSize(state.tickHotTable_[id].asyncQueueRaw)
+               + state.asyncHotTable_[id].asyncSize(state.asyncHotTable_[id].asyncStagingRaw)
+               + (state.asyncHotTable_[id].asyncCarryPending ? 1u : 0u)) : 0;
         d.tasks.push_back(std::move(info));
     }
     collectPendingSubmissions(d);
@@ -743,7 +841,11 @@ void TickPool<Duration, OptionsT, ThreadPoolType>::clearAsyncQueues() {
     auto& state = runtime_.state();
     for (TaskID id = 0; id < state.tickHotTable_.size(); ++id) {
         auto& async = state.asyncHotTable_[id];
-        if (async.asyncClear) async.asyncClear(state.tickHotTable_[id].asyncQueueRaw);
+        if (!async.asyncClear) continue;
+        async.asyncClear(state.tickHotTable_[id].asyncQueueRaw);
+        // 暂存队列与滞留槽一并作废（否则恢复/回滚后，上一世的异步结果会在下个 tick 边界"复活"）
+        async.asyncClear(async.asyncStagingRaw);
+        async.asyncCarryPending = false;
     }
 }
 

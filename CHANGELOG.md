@@ -5,7 +5,7 @@
 
 | 项 | 值 |
 | --- | --- |
-| 当前版本 | **1.0.0** |
+| 当前版本 | **1.1.0** |
 | 许可证 | **MIT**（见 `LICENSE`） |
 | 版权 | Copyright (c) 2026 ry w |
 | 平台 | Windows / MSVC（C++20） |
@@ -34,10 +34,10 @@
 
 | 位置 | 形式 | 说明 |
 | --- | --- | --- |
-| `lib/tickpool/VERSION` | `1.0.0` | **权威记录**，机器可读 |
+| `lib/tickpool/VERSION` | `1.1.0` | **权威记录**，机器可读 |
 | `lib/tickpool/README.md` | 首部"本包信息"块 | 面向人的摘要 |
 | `lib/tickpool/CHANGELOG.md`（本文件） | 上表 | 面向人的摘要 |
-| git tag | `v1.0.0` | 发行锚点（仅在源仓库） |
+| git tag | `v1.1.0` | 发行锚点（仅在源仓库） |
 
 > 库代码内**没有**版本宏：本包**不修改源码**，故版本号不通过 `<TickPool.h>` 暴露。
 > 若你的程序需要自报所链接的 TickPool 版本，请自行记录本文件中的版本号。
@@ -69,9 +69,46 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-### [未发布]
+### [1.1.0] - 2026-10-11
 
-尚未有新的对外版本。
+**修复：异步执行模型 —— 此前"异步"其实是在调用线程的栈上同步跑完**
+
+过去异步体（匿名 `work` 与 `SubmitMode::Async` action）在**提交线程的栈上同步执行完**。当提交发生在
+构造相、而该波次又被「小波次内联」改由 run 线程执行时，一个慢异步体会**把 `run()` 整个卡住**
+（实测：20ms 的 tick 被 150ms 的异步体拖到 ~155ms/tick，5 个 tick 本该 250ms 实际 780ms）——
+与"异步"的语义相悖；关掉内联只换执行线程，tick 一样被拖长。另有一个静默缺陷：**`void` 结果的匿名
+异步会被丢弃**（走了该任务并未设置的入队函数指针）。1.1.0 起：
+
+- **执行位置**：异步体（匿名 `work` 与 `SubmitMode::Async` action）一律投递到线程池的**异步泳道**，
+  由 worker 执行。**run 线程与"tick 角色"线程都不消费它**（run 线程的帮助执行 `executeUpTo` 与偷取
+  `stealTask` 只看 tick 队列）→ 异步不再占用 `run()`。
+- **结果可见性（边界发布）**：异步体把结果写入该任务的 staging 队列，run 线程在**每个 tick 开头**
+  发布到可读队列 → **在 tick N 提交的异步结果，最早在 tick N+1 的 destruct 可见**（慢异步体顺延到
+  更后面的边界）。过去"同 tick 可见"其实是与 destruct 抢时间的隐式竞争，**不再是保证**。
+  发布**永不阻塞**（非阻塞搬运 + 单条滞留槽；阻塞会在 `Block` 背压下自锁）。
+- **异常**：异步体（含匿名异步）的异常统一在泳道线程"接住 + 上报 `onTaskException`"，**不再抛给提交方**
+  （提交方早已返回）；`void` 结果不再被丢弃。
+
+**新增能力**
+
+- **`waitAsyncIdle()`**：等全部在途异步体结束并把结果发布为可读；**在 tick 回调内调用抛
+  `std::runtime_error`**（提前发布会破坏边界规则）。典型用法：`run(1)` → `waitAsyncIdle()` → `run(1)`。
+- **`pendingAsyncWork()`**：在途异步体数（诊断/自检）。
+- **`asyncThreadRatio`**（宏 `TICKPOOL_ASYNC_THREAD_RATIO`，默认 `0`）：**异步专用线程比例**。
+  `0` = 不预留（异步与 tick 共享全部 worker，默认）；`>0` = 预留 `round(N × ratio)` 条线程（clamp 到
+  `[1, N-1]`）**只服务异步泳道**，其余做 tick 任务 —— 长异步体因此不再抢占 tick 的 worker。
+  异步线程空闲时可**单向帮忙** tick 队列；**tick 线程永不消费异步泳道**。线程总数不变（不新增线程）。
+  比例越界（`<0` 或 `>1`）→ 池构造抛 `std::invalid_argument`；线程数 `< 2` 且 `ratio > 0` 同样抛错。
+- **生命周期**：`run()` 返回不再意味着异步已跑完；`~TickPool()` 会先排空在途异步体（含泳道）再析构成员。
+
+**兼容性说明（为什么是 MINOR 而不是 MAJOR）**
+
+- 把"异步"实现成"调用线程同步执行完"是**缺陷**（没有任何文档承诺支撑，且会阻塞 tick），本版是**修复**；
+- 需要留意的一处可观察变化：**"提交异步后同一 tick 的 destruct 就能读到结果"不再成立**。若代码依赖它，
+  改成下一 tick 读，或在 `run()` 之外用 `waitAsyncIdle()` 对账；
+- 自建线程池需补齐概念成员：`enqueueAsync` / `wakeWorkers` / `waitIdle` / `waitAsyncIdle` /
+  `pendingAsyncWork` / `executeUpTo`（框架会把 `options.asyncThreadRatio` 传给支持
+  `(线程数, 异步比例)` 构造的池；不支持则回退默认构造，角色划分自理）。
 
 ### [1.0.0] - 2026-09-28
 
